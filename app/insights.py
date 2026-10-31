@@ -1,42 +1,60 @@
 """
-Spike detection: flags months where a city had far more sightings than usual.
+Spike detection: finds months where a city had a lot more sightings than usual.
+
+For each city I count the sightings in every month. Then for each month I look at
+the 12 months before it, work out the average and how much it normally varies,
+and turn that into a z-score. A high z-score means that month was unusual.
 """
-import pandas as pd
+from collections import Counter
+from statistics import mean, stdev
 
 from app.regions import region_for
 
 
-def find_spikes(rows, threshold: float = 2.0, window: int = 12, min_count: int = 3) -> list[dict]:
-    """rows: (date, location) pairs. Returns spikes, the most unusual first."""
-    df = pd.DataFrame(rows, columns=["date", "location"])
-    if df.empty:
+def month_of(date):
+    return f"{date.year}-{date.month:02d}"
+
+
+def months_between(first, last):
+    """Every month from first to last, e.g. "2023-11", "2023-12", "2024-01"."""
+    year, month = int(first[:4]), int(first[5:])
+    months = []
+    while f"{year}-{month:02d}" <= last:
+        months.append(f"{year}-{month:02d}")
+        month += 1
+        if month == 13:
+            year, month = year + 1, 1
+    return months
+
+
+def find_spikes(rows, threshold=2.0, min_count=3, window=12):
+    """rows is a list of (date, city) pairs. Returns the spikes, most unusual first."""
+    if not rows:
         return []
 
-    df["month"] = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None).dt.to_period("M")
-
-    counts = df.groupby(["location", "month"]).size().unstack(fill_value=0)
-    all_months = pd.period_range(counts.columns.min(), counts.columns.max(), freq="M")
-    counts = counts.reindex(columns=all_months, fill_value=0)
-
-    history = counts.T.shift(1).rolling(window, min_periods=window)
-    mean = history.mean().T
-    
-    std = history.std().T.clip(lower=0.5)
-    z_scores = (counts - mean) / std
+    counts = Counter((city, month_of(date)) for date, city in rows)
+    all_months = months_between(min(m for _, m in counts), max(m for _, m in counts))
+    cities = sorted({city for city, _ in counts})
 
     spikes = []
-    for city in counts.index:
-        for month in counts.columns:
-            count = int(counts.at[city, month])
-            z = z_scores.at[city, month]
-            if pd.notna(z) and z >= threshold and count >= min_count:
+    for city in cities:
+        monthly = [counts[(city, month)] for month in all_months]
+
+        for i in range(window, len(monthly)):
+            history = monthly[i - window:i]  
+            usual = mean(history)
+            spread = max(stdev(history), 0.5)
+            z_score = (monthly[i] - usual) / spread
+
+            if z_score >= threshold and monthly[i] >= min_count:
                 spikes.append({
                     "location": city,
                     "region": region_for(city),
-                    "period": str(month),
-                    "count": count,
-                    "usual": round(float(mean.at[city, month]), 2),
-                    "z_score": round(float(z), 2),
+                    "period": all_months[i],
+                    "count": monthly[i],
+                    "usual": round(usual, 2),
+                    "z_score": round(z_score, 2),
                 })
 
-    return sorted(spikes, key=lambda s: s["z_score"], reverse=True)
+    spikes.sort(key=lambda spike: spike["z_score"], reverse=True)
+    return spikes
